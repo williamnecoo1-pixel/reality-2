@@ -18,8 +18,8 @@ SOURCE_URLS = [
 XRAY = "./xray/xray"
 
 TEST_URLS = [
-    "http://cp.cloudflare.com/generate_204",
     "http://www.gstatic.com/generate_204",
+    "http://www.apple.com/generate_204",
 ]
 
 TIMEOUT = 5
@@ -153,7 +153,7 @@ def test_config(index, config):
                 with socket.create_connection(("127.0.0.1", local_port), timeout=0.3): pass
                 started = True
                 break
-            except OSError: time.sleep(0.1)
+            except OSError: time.sleep(0.2)
 
         if not started: 
             return {"ok": False, "reason": "xray_died"}
