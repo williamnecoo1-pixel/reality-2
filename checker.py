@@ -12,7 +12,7 @@ import requests
 
 SOURCE_URLS = [
     
-    "https://github.com/Mohamedhnini-a/Neverstops/raw/refs/heads/main/sub.txt",
+    "https://github.com/williamnecoo1-pixel/Neverstops/raw/refs/heads/main/sub.txt",
     
 ]
 XRAY = "./xray/xray"
