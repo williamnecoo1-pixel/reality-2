@@ -1,6 +1,8 @@
+
 import concurrent.futures
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -8,228 +10,685 @@ import time
 import base64
 import threading
 from urllib.parse import parse_qs, unquote, urlparse
+
 import requests
+
+# ============================================================
+# 1. SOURCES
+# ============================================================
 
 SOURCE_URLS = [
     "https://github.com/williamnecoo1-pixel/testrw/raw/refs/heads/main/reality_configs.txt",
-   "https://github.com/williamnecoo1-pixel/ss/raw/refs/heads/main/sub.txt",
-    
+    "https://github.com/williamnecoo1-pixel/ss/raw/refs/heads/main/sub.txt",
 ]
+
 XRAY = "./xray/xray"
 
 TEST_URLS = [
-    "http://www.gstatic.com/generate_204",
-    "http://www.apple.com/generate_204",
+    "https://www.gstatic.com/generate_204",
+    "https://www.apple.com/library/test/success.html",
 ]
 
 TIMEOUT = 15
-MAX_WORKERS = 15 # نقصناها لـ 15 باش ما يتخنقش السيرفر
-BASE_PORT = 10808
+MAX_WORKERS = 15
 MAX_LATENCY_MS = 5000
 
 _tls = threading.local()
-def get_session():
-    if not hasattr(_tls, "s"):
-        s = requests.Session()
-        s.trust_env = False
-        _tls.s = s
-    return _tls.s
 
-def test_once(proxies):
-    last_error = None
-    session = get_session()
-    for url in TEST_URLS:
-        try:
-            start = time.perf_counter()
-            response = session.get(url, proxies=proxies, timeout=TIMEOUT, allow_redirects=False)
-            elapsed = (time.perf_counter() - start) * 1000
-            if response.status_code in (200, 204):
-                return round(elapsed), None
-            last_error = f"http_{response.status_code}"
-            if 500 <= response.status_code < 600:
-                continue
-            return None, last_error
-        except requests.exceptions.Timeout:
-            last_error = "timeout"
-        except requests.exceptions.ProxyError:
-            return None, "proxy_error"
-        except Exception as e:
-            last_error = type(e).__name__
-    return None, last_error
+
+def get_session():
+    if not hasattr(_tls, "session"):
+        session = requests.Session()
+        session.trust_env = False
+        _tls.session = session
+    return _tls.session
+
+
+# ============================================================
+# 2. DOWNLOAD + SUBSCRIPTION DECODING
+# ============================================================
+
+def extract_links(text):
+    pattern = r'(?:vless|trojan|vmess)://[^\s<>"\']+'
+    return re.findall(pattern, text, re.IGNORECASE)
+
+
+def decode_subscription(text):
+    links = extract_links(text)
+
+    if links:
+        return links
+
+    # Try Base64 subscription
+    compact = "".join(text.split())
+
+    try:
+        padded = compact + "=" * (-len(compact) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode(
+            "utf-8", errors="ignore"
+        )
+        links = extract_links(decoded)
+
+        if links:
+            return links
+    except Exception:
+        pass
+
+    return []
+
 
 def download_configs():
     configs = []
-    for source_url in SOURCE_URLS:
+
+    for url in SOURCE_URLS:
         try:
-            print(f"Downloading: {source_url}", flush=True)
-            response = requests.get(source_url, timeout=20)
+            print(f"[DOWNLOAD] {url}", flush=True)
+
+            response = requests.get(
+                url,
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
             response.raise_for_status()
-            configs.extend([line.strip() for line in response.text.splitlines() if line.strip()])
+
+            found = decode_subscription(response.text)
+
+            print(
+                f"[SOURCE] Found {len(found)} configurations",
+                flush=True
+            )
+
+            configs.extend(found)
+
         except Exception as e:
-            print(f"FAILED: {e}", flush=True)
+            print(f"[DOWNLOAD FAILED] {type(e).__name__}", flush=True)
+
     return list(dict.fromkeys(configs))
+
+
+# ============================================================
+# 3. CONFIG PARSER
+# ============================================================
 
 def parse_config(line):
     try:
-        if line.startswith("vmess://"):
-            b64_str = line[8:].split("#")[0].strip()
-            b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
-            config = json.loads(base64.b64decode(b64_str).decode('utf-8'))
+
+        # ---------------- VMESS ----------------
+
+        if line.lower().startswith("vmess://"):
+
+            b64 = line[8:].split("#")[0].strip()
+            b64 += "=" * (-len(b64) % 4)
+
+            raw = base64.urlsafe_b64decode(b64)
+            data = json.loads(raw.decode("utf-8"))
+
             return {
-                "protocol": "vmess", "server": config.get("add"), "port": int(config.get("port", 443)),
-                "id": config.get("id"), "aid": int(config.get("aid", 0)), "scy": config.get("scy", "auto"),
-                "net": config.get("net", "tcp"), "tls": config.get("tls", ""), "host": config.get("host", ""),
-                "sni": config.get("sni", ""), "path": config.get("path", "/"), "original": line,
+                "protocol": "vmess",
+                "server": data.get("add"),
+                "port": int(data.get("port", 443)),
+                "id": data.get("id"),
+                "aid": int(data.get("aid", 0)),
+                "scy": data.get("scy", "auto"),
+                "net": (data.get("net") or "tcp").lower(),
+                "security": (data.get("tls") or "none").lower(),
+                "host": data.get("host", ""),
+                "sni": data.get("sni", ""),
+                "path": data.get("path", "/"),
+                "mode": data.get("mode", ""),
+                "serviceName": data.get("serviceName", ""),
+                "alpn": data.get("alpn", ""),
+                "fp": data.get("fp", ""),
+                "original": line,
             }
 
-        if line.startswith("vless://") or line.startswith("trojan://"):
+        # ---------------- VLESS / TROJAN ----------------
+
+        if line.lower().startswith(("vless://", "trojan://")):
+
             parsed = urlparse(line)
-            params = parse_qs(parsed.query, keep_blank_values=True)
-            get = lambda name: params.get(name, [""])[0]
+
+            params = parse_qs(
+                parsed.query,
+                keep_blank_values=True
+            )
+
+            def get(name, default=""):
+                return params.get(name, [default])[0]
+
             return {
-                "protocol": parsed.scheme.lower(), "server": parsed.hostname, "port": parsed.port or 443,
-                "uuid": parsed.username, "password": parsed.username, "net": get("type") or "tcp",
-                "security": get("security") or "none", "sni": get("sni") or parsed.hostname,
-                "host": get("host") or "", "path": unquote(get("path")) or "/", "alpn": get("alpn") or "",
-                "fp": get("fp") or "", "pbk": get("pbk") or "", "sid": get("sid") or "",
-                "spx": get("spx") or "/", "flow": get("flow") or "", "original": line,
+                "protocol": parsed.scheme.lower(),
+                "server": parsed.hostname,
+                "port": parsed.port or 443,
+
+                "uuid": unquote(parsed.username or ""),
+                "password": unquote(parsed.username or ""),
+
+                "net": (
+                    get("type") or get("net") or "tcp"
+                ).lower(),
+
+                "security": (
+                    get("security") or "none"
+                ).lower(),
+
+                "sni": get("sni") or parsed.hostname,
+                "host": get("host"),
+
+                "path": get("path") or "/",
+                "mode": get("mode"),
+
+                "serviceName": (
+                    get("serviceName")
+                    or get("servicename")
+                    or get("path")
+                ),
+
+                "alpn": get("alpn"),
+                "fp": get("fp"),
+
+                "pbk": get("pbk"),
+                "sid": get("sid"),
+                "spx": get("spx") or "/",
+                "flow": get("flow"),
+
+                "original": line,
             }
+
     except Exception:
         return None
+
     return None
 
+
+# ============================================================
+# 4. BUILD XRAY CONFIG
+# ============================================================
+
 def make_xray_config(config, local_port):
-    stream_settings = {"network": config.get("net", "tcp"), "security": config.get("security", config.get("tls") or "none")}
-    
-    if stream_settings["security"] == "tls":
-        stream_settings["tlsSettings"] = {"serverName": config.get("sni") or config.get("server"), "allowInsecure": False}
-        if config.get("alpn"): stream_settings["tlsSettings"]["alpn"] = config["alpn"].split(",")
-        if config.get("fp"): stream_settings["tlsSettings"]["fingerprint"] = config["fp"]
-            
-    elif stream_settings["security"] == "reality":
-        stream_settings["realitySettings"] = {
-            "serverName": config.get("sni") or config.get("server"), "fingerprint": config.get("fp") or "chrome",
-            "publicKey": config.get("pbk"), "shortId": config.get("sid"), "spiderX": config.get("spx"),
+
+    net = config.get("net", "tcp").lower()
+    security = config.get("security", "none").lower()
+
+    stream = {
+        "network": net,
+        "security": security,
+    }
+
+    # ---------------- TLS ----------------
+
+    if security == "tls":
+
+        tls_settings = {
+            "serverName": config.get("sni") or config["server"],
+            "allowInsecure": False,
         }
 
-    net = config.get("net", "tcp")
+        if config.get("alpn"):
+            tls_settings["alpn"] = [
+                x.strip()
+                for x in config["alpn"].split(",")
+                if x.strip()
+            ]
+
+        if config.get("fp"):
+            tls_settings["fingerprint"] = config["fp"]
+
+        stream["tlsSettings"] = tls_settings
+
+    # ---------------- REALITY ----------------
+
+    elif security == "reality":
+
+        stream["realitySettings"] = {
+            "serverName": config.get("sni") or config["server"],
+            "fingerprint": config.get("fp") or "chrome",
+            "publicKey": config.get("pbk"),
+            "shortId": config.get("sid"),
+            "spiderX": config.get("spx", "/"),
+        }
+
+    # ---------------- WEBSOCKET ----------------
+
     if net == "ws":
-        stream_settings["wsSettings"] = {"path": config.get("path", "/"), "host": config.get("host") or config.get("sni")}
+
+        ws = {
+            "path": config.get("path") or "/",
+        }
+
+        if config.get("host"):
+            ws["headers"] = {
+                "Host": config["host"]
+            }
+
+        stream["wsSettings"] = ws
+
+    # ---------------- GRPC ----------------
+
     elif net == "grpc":
-        stream_settings["grpcSettings"] = {"serviceName": config.get("path")}
+
+        grpc = {
+            "serviceName": config.get("serviceName") or "",
+        }
+
+        if config.get("mode") == "multi":
+            grpc["multiMode"] = True
+
+        stream["grpcSettings"] = grpc
+
+    # ---------------- XHTTP ----------------
+
+    elif net == "xhttp":
+
+        xhttp = {
+            "path": config.get("path") or "/",
+        }
+
+        if config.get("host"):
+            xhttp["host"] = config["host"]
+
+        if config.get("mode"):
+            xhttp["mode"] = config["mode"]
+
+        stream["xhttpSettings"] = xhttp
+
+    # ---------------- VLESS ----------------
 
     if config["protocol"] == "vless":
-        user = {"id": config["uuid"], "encryption": "none"}
-        if config.get("flow"): user["flow"] = config["flow"]
-        outbound = {"protocol": "vless", "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [user]}]}, "streamSettings": stream_settings}
-    elif config["protocol"] == "trojan":
-        outbound = {"protocol": "trojan", "settings": {"servers": [{"address": config["server"], "port": config["port"], "password": config["password"]}]}, "streamSettings": stream_settings}
-    elif config["protocol"] == "vmess":
-        outbound = {"protocol": "vmess", "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [{"id": config["id"], "alterId": config["aid"], "security": config["scy"]}]}]}, "streamSettings": stream_settings}
-    else: return None
 
-    return {"log": {"loglevel": "error"}, "inbounds": [{"listen": "127.0.0.1", "port": local_port, "protocol": "http", "settings": {}}], "outbounds": [outbound]}
+        user = {
+            "id": config["uuid"],
+            "encryption": "none",
+        }
+
+        if config.get("flow"):
+            user["flow"] = config["flow"]
+
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": config["server"],
+                    "port": config["port"],
+                    "users": [user],
+                }]
+            },
+            "streamSettings": stream,
+        }
+
+    # ---------------- TROJAN ----------------
+
+    elif config["protocol"] == "trojan":
+
+        outbound = {
+            "protocol": "trojan",
+            "settings": {
+                "servers": [{
+                    "address": config["server"],
+                    "port": config["port"],
+                    "password": config["password"],
+                }]
+            },
+            "streamSettings": stream,
+        }
+
+    # ---------------- VMESS ----------------
+
+    elif config["protocol"] == "vmess":
+
+        outbound = {
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": config["server"],
+                    "port": config["port"],
+                    "users": [{
+                        "id": config["id"],
+                        "alterId": config["aid"],
+                        "security": config["scy"],
+                    }],
+                }]
+            },
+            "streamSettings": stream,
+        }
+
+    else:
+        return None
+
+    return {
+        "log": {
+            "loglevel": "error"
+        },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": local_port,
+            "protocol": "http",
+            "settings": {},
+        }],
+        "outbounds": [outbound],
+    }
+
+
+# ============================================================
+# 5. HTTP TEST
+# ============================================================
+
+def test_once(proxies):
+
+    session = get_session()
+    last_error = "no_response"
+
+    for url in TEST_URLS:
+
+        try:
+
+            start = time.perf_counter()
+
+            response = session.get(
+                url,
+                proxies=proxies,
+                timeout=TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+
+            elapsed = (time.perf_counter() - start) * 1000
+            status = response.status_code
+            response.close()
+
+            if status in (200, 204):
+                return round(elapsed), None
+
+            last_error = f"http_{status}"
+
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+
+        except requests.exceptions.ProxyError:
+            last_error = "proxy_error"
+
+        except Exception as e:
+            last_error = type(e).__name__
+
+    return None, last_error
+
+
+# ============================================================
+# 6. TEST CONFIG
+# ============================================================
+
+def get_free_port():
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 
 def test_config(index, config):
-    local_port = BASE_PORT + (index % 40000)
-    config_file, log_file, process = None, None, None
-    
-    try:
-        xray_config = make_xray_config(config, local_port)
-        if not xray_config: return {"ok": False, "reason": "make_failed"}
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    local_port = get_free_port()
+
+    config_file = None
+    log_file = None
+    process = None
+
+    try:
+
+        xray_config = make_xray_config(config, local_port)
+
+        if not xray_config:
+            return {
+                "ok": False,
+                "reason": "make_failed",
+                "server": config.get("server"),
+            }
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False
+        ) as f:
+
             json.dump(xray_config, f)
             config_file = f.name
 
-        log_file = tempfile.NamedTemporaryFile(suffix=".log", delete=False).name
+        log_file = tempfile.NamedTemporaryFile(
+            suffix=".log",
+            delete=False
+        ).name
+
         with open(log_file, "w") as log_handle:
-            process = subprocess.Popen([XRAY, "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=log_handle, start_new_session=True)
+
+            process = subprocess.Popen(
+                [XRAY, "run", "-c", config_file],
+                stdout=subprocess.DEVNULL,
+                stderr=log_handle,
+                start_new_session=True,
+            )
 
         started = False
-        for _ in range(15):
-            if process.poll() is not None: break
-            try:
-                with socket.create_connection(("127.0.0.1", local_port), timeout=0.3): pass
-                started = True
+
+        for _ in range(30):
+
+            if process.poll() is not None:
                 break
-            except OSError: time.sleep(0.2)
 
-        if not started: 
-            return {"ok": False, "reason": "xray_died"}
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", local_port),
+                    timeout=0.3
+                ):
+                    started = True
+                    break
 
-        proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}
-        latency, err = test_once(proxies)
-        
+            except OSError:
+                time.sleep(0.2)
+
+        if not started:
+
+            reason = "xray_died"
+
+            if log_file and os.path.exists(log_file):
+                try:
+                    with open(log_file, encoding="utf-8", errors="ignore") as f:
+                        message = f.read()[-500:]
+                        if message.strip():
+                            reason = "xray_error"
+                except Exception:
+                    pass
+
+            return {
+                "ok": False,
+                "reason": reason,
+                "server": config.get("server"),
+            }
+
+        proxies = {
+            "http": f"http://127.0.0.1:{local_port}",
+            "https": f"http://127.0.0.1:{local_port}",
+        }
+
+        latency, error = test_once(proxies)
+
         if latency is not None and latency <= MAX_LATENCY_MS:
-            return {"ok": True, "latency": latency, "line": config["original"], "server": config["server"]}
-        return {"ok": False, "reason": err, "server": config["server"]}
+
+            return {
+                "ok": True,
+                "latency": latency,
+                "line": config["original"],
+                "server": config["server"],
+                "protocol": config["protocol"],
+                "network": config["net"],
+            }
+
+        return {
+            "ok": False,
+            "reason": error,
+            "server": config.get("server"),
+        }
 
     except Exception as e:
-        return {"ok": False, "reason": str(type(e).__name__), "server": config["server"]}
+
+        return {
+            "ok": False,
+            "reason": type(e).__name__,
+            "server": config.get("server"),
+        }
+
     finally:
+
         if process:
-            try: process.terminate(); process.wait(timeout=0.5)
-            except: 
-                try: process.kill()
-                except: pass
+
+            try:
+                process.terminate()
+                process.wait(timeout=1)
+
+            except Exception:
+
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
         for path in (config_file, log_file):
+
             if path and os.path.exists(path):
-                try: os.remove(path)
-                except: pass
+
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+
+# ============================================================
+# 7. MAIN
+# ============================================================
 
 def main():
-    print("Downloading configs...", flush=True)
+
+    print("Downloading configurations...", flush=True)
+
     lines = download_configs()
-    configs = [c for c in (parse_config(l) for l in lines) if c]
+
+    configs = []
+
+    for line in lines:
+
+        config = parse_config(line)
+
+        if not config:
+            continue
+
+        if not config.get("server"):
+            continue
+
+        if config.get("port") != 443:
+            continue
+
+        if config.get("security") != "tls":
+            continue
+
+        if config.get("net") not in (
+            "ws", "xhttp", "grpc", "tcp", "raw"
+        ):
+            continue
+
+        configs.append(config)
+
+    # Remove duplicates
+    unique = {}
+
+    for config in configs:
+        unique[config["original"]] = config
+
+    configs = list(unique.values())
+
     total = len(configs)
-    print(f"\n✅ Total configs to test: {total}\n", flush=True)
 
-    if not configs: return
+    print(
+        f"\n[READY] Total configs: {total}",
+        flush=True
+    )
 
-    tasks = list(enumerate(configs, start=1))
+    if not os.path.isfile(XRAY):
+        print(f"[ERROR] Xray binary not found: {XRAY}")
+        return
+
+    if not configs:
+        print("[ERROR] No supported configurations found.")
+        return
+
     results = []
     completed = 0
-    working_count = 0
+    working = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        iterator = iter(tasks)
-        pending = set()
-        for _ in range(MAX_WORKERS):
-            try: pending.add(executor.submit(test_config, *next(iterator)))
-            except StopIteration: break
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-        while pending:
-            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                completed += 1
-                try:
-                    res = future.result()
-                    if res.get("ok"):
-                        working_count += 1
-                        results.append(res)
-                        # ✅ طباعة كل كونفيغ خدام دغيا
-                        print(f"[ONLINE ✅] {res['latency']}ms | {res['server']}", flush=True)
-                    else:
-                        # (اختياري) تقدر تحيد هاد السطر إلا بغيتي اللوغ يكون نقي)
-                        print(f"[FAILED❌] {res.get('server')} | {res.get('reason')}", flush=True)
-                except Exception as e: 
-                    pass
-                
-                # ✅ طباعة التقدم كل 10 كونفيغات
-                if completed % 10 == 0 or completed == total:
-                    print(f"---🔜 [Progress] {completed}/{total} | Working: {working_count} | Remaining: {total - completed} ---", flush=True)
+        futures = {
+            executor.submit(test_config, i, config): config
+            for i, config in enumerate(configs, start=1)
+        }
 
-                try: pending.add(executor.submit(test_config, *next(iterator)))
-                except StopIteration: pass
+        for future in concurrent.futures.as_completed(futures):
+
+            completed += 1
+
+            try:
+
+                result = future.result()
+
+                if result["ok"]:
+
+                    working += 1
+                    results.append(result)
+
+                    print(
+                        f"[ONLINE] {result['latency']}ms | "
+                        f"{result['protocol']} | "
+                        f"{result['network']} | "
+                        f"{result['server']}",
+                        flush=True
+                    )
+
+                else:
+
+                    print(
+                        f"[FAILED] "
+                        f"{result.get('server')} | "
+                        f"{result.get('reason')}",
+                        flush=True
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"[ERROR] {type(e).__name__}",
+                    flush=True
+                )
+
+            if completed % 10 == 0 or completed == total:
+
+                print(
+                    f"\n[PROGRESS] {completed}/{total} | "
+                    f"Working: {working} | "
+                    f"Remaining: {total-completed}\n",
+                    flush=True
+                )
 
     results.sort(key=lambda x: x["latency"])
 
     with open("working.txt", "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(r["line"] + "\n")
 
-    print(f"\n✅ Done! Saved {len(results)} working configs to working.txt", flush=True)
+        for result in results:
+            f.write(result["line"] + "\n")
+
+    print(
+        f"\n[DONE] {len(results)} working configurations saved.",
+        flush=True
+    )
+
 
 if __name__ == "__main__":
     main()
