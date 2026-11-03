@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
 SOURCE_URLS = [
-    
+    "https://github.com/williamnecoo1-pixel/testrw/raw/refs/heads/main/reality_configs.txt",
    "https://github.com/williamnecoo1-pixel/ss/raw/refs/heads/main/sub.txt",
     
 ]
