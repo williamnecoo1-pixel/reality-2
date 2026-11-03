@@ -209,16 +209,16 @@ def main():
                         working_count += 1
                         results.append(res)
                         # ✅ طباعة كل كونفيغ خدام دغيا
-                        print(f"[ONLINE] {res['latency']}ms | {res['server']}", flush=True)
+                        print(f"[ONLINE ✅] {res['latency']}ms | {res['server']}", flush=True)
                     else:
                         # (اختياري) تقدر تحيد هاد السطر إلا بغيتي اللوغ يكون نقي)
-                        print(f"[FAILED] {res.get('server')} | {res.get('reason')}", flush=True)
+                        print(f"[FAILED❌] {res.get('server')} | {res.get('reason')}", flush=True)
                 except Exception as e: 
                     pass
                 
                 # ✅ طباعة التقدم كل 10 كونفيغات
                 if completed % 10 == 0 or completed == total:
-                    print(f"--- [Progress] {completed}/{total} | Working: {working_count} | Remaining: {total - completed} ---", flush=True)
+                    print(f"---🔜 [Progress] {completed}/{total} | Working: {working_count} | Remaining: {total - completed} ---", flush=True)
 
                 try: pending.add(executor.submit(test_config, *next(iterator)))
                 except StopIteration: pass
