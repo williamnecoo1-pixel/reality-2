@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4 # ✅ إصدار صحيح
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v5 # ✅ إصدار صحيح
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -31,9 +31,8 @@ jobs:
 
       - name: Download Xray
         run: |
-          # ملاحظة: الإصدار v26.7.28 مشكوك فيه. هادا إصدار معروف ومستقر:
-          XRAY_VERSION="v1.8.24"
-          wget -q "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -O xray.zip
+          # ✅ تحديث: تحميل آخر إصدار (latest) بدل الإصدار القديم باش يخدم xhttp
+          wget -q "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -O xray.zip
           unzip -q xray.zip -d xray
           chmod +x xray/xray
           ./xray/xray version
@@ -75,7 +74,7 @@ jobs:
           fi
 
       - name: Upload working configs
-        uses: actions/upload-artifact@v4 # ✅ إصدار صحيح
+        uses: actions/upload-artifact@v4
         with:
           name: working-configs
           path: working_configs.txt
