@@ -104,7 +104,6 @@ def make_xray_config(config, local_port):
     net = config.get("net", "tcp").lower()
     security = config.get("security", config.get("tls") or "none").lower()
     
-    # إصلاح: تحويل raw لـ tcp
     if net == "raw": net = "tcp"
 
     stream_settings = {"network": net, "security": security}
@@ -112,7 +111,7 @@ def make_xray_config(config, local_port):
     if security == "tls":
         stream_settings["tlsSettings"] = {
             "serverName": config.get("sni") or config.get("server"), 
-            "allowInsecure": True,
+            "allowInsecure": True, # إجباري هنا حيت كنستعملو كلاودفلير
             "fingerprint": config.get("fp") or "chrome"
         }
         if config.get("alpn"): 
@@ -137,7 +136,6 @@ def make_xray_config(config, local_port):
 
     if config["protocol"] == "vless":
         user = {"id": config["uuid"], "encryption": "none"}
-        # إصلاح: الـ flow كيخدم غير مع tcp
         if config.get("flow") and net == "tcp": 
             user["flow"] = config["flow"]
         outbound = {"protocol": "vless", "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [user]}]}, "streamSettings": stream_settings}
@@ -153,17 +151,22 @@ def test_config(index, config):
     local_port = BASE_PORT + (index % 40000)
     config_file, log_file, process = None, None, None
     
+    # معرفة نوع الكونفيغ للطباعة
+    net_type = config.get("net", "unknown").upper()
+    server_ip = config.get("server", "Unknown")
+    
     try:
         xray_config = make_xray_config(config, local_port)
-        if not xray_config: return {"ok": False, "reason": "make_failed", "server": config.get("server", "Unknown")}
+        if not xray_config: return {"ok": False, "reason": "make_failed", "server": f"[{net_type}] {server_ip}"}
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(xray_config, f)
             config_file = f.name
 
         log_file = tempfile.NamedTemporaryFile(suffix=".log", delete=False).name
+        # توجيه stdout و stderr للوغ معاً باش نمسكو أي غلط
         with open(log_file, "w") as log_handle:
-            process = subprocess.Popen([XRAY, "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=log_handle, start_new_session=True)
+            process = subprocess.Popen([XRAY, "run", "-c", config_file], stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
 
         started = False
         for _ in range(15):
@@ -175,26 +178,25 @@ def test_config(index, config):
             except OSError: time.sleep(0.2)
 
         if not started: 
-            # إصلاح: قراءة سبب الطيحة من اللوغ
             error_log = ""
             try:
                 with open(log_file, "r", errors="ignore") as f:
                     error_log = f.read().strip().replace("\n", " | ")
             except Exception:
                 pass
-            return {"ok": False, "reason": f"xray_died: {error_log[-150:]}", "server": config.get("server", "Unknown")}
+            return {"ok": False, "reason": f"xray_died: {error_log[-150:]}", "server": f"[{net_type}] {server_ip}"}
 
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}
         latency, err = test_once(proxies)
         
         if latency is not None and latency <= MAX_LATENCY_MS:
-            return {"ok": True, "latency": latency, "line": config["original"], "server": config.get("server", "Unknown")}
-        return {"ok": False, "reason": err, "server": config.get("server", "Unknown")}
+            return {"ok": True, "latency": latency, "line": config["original"], "server": f"[{net_type}] {server_ip}"}
+        return {"ok": False, "reason": err, "server": f"[{net_type}] {server_ip}"}
 
     except FileNotFoundError:
-        return {"ok": False, "reason": "xray_binary_missing", "server": config.get("server", "Unknown")}
+        return {"ok": False, "reason": "xray_binary_missing", "server": f"[{net_type}] {server_ip}"}
     except Exception as e:
-        return {"ok": False, "reason": str(type(e).__name__), "server": config.get("server", "Unknown")}
+        return {"ok": False, "reason": str(type(e).__name__), "server": f"[{net_type}] {server_ip}"}
     finally:
         if process:
             try: process.terminate(); process.wait(timeout=0.5)
