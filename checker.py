@@ -23,7 +23,7 @@ TEST_URLS = [
 ]
 
 TIMEOUT = 15
-MAX_WORKERS = 15
+MAX_WORKERS = 15 
 BASE_PORT = 10808
 MAX_LATENCY_MS = 5000
 
@@ -88,13 +88,13 @@ def parse_config(line):
             get = lambda name: params.get(name, [""])[0]
             net_type = (get("type") or get("net") or "tcp").lower()
             return {
-                "protocol": parsed.scheme.lower(), "server": parsed.hostname, "port": parsed.port or 443,
+                "protocol": parsed.scheme.lower(), "server": parsed.hostname or get("host"), "port": parsed.port or 443,
                 "uuid": parsed.username, "password": parsed.username, "net": net_type,
                 "security": get("security") or "none", "sni": get("sni") or parsed.hostname,
                 "host": get("host") or "", "path": unquote(get("path")) or "/", "alpn": get("alpn") or "",
                 "fp": get("fp") or "", "pbk": get("pbk") or "", "sid": get("sid") or "",
                 "spx": get("spx") or "/", "flow": get("flow") or "", "original": line,
-                "serviceName": get("serviceName") # خاص بـ gRPC
+                "serviceName": get("serviceName") 
             }
     except Exception:
         return None
@@ -104,18 +104,21 @@ def make_xray_config(config, local_port):
     net = config.get("net", "tcp").lower()
     security = config.get("security", config.get("tls") or "none").lower()
     
-    # إعدادات النقل (Transport Settings)
+    # إصلاح: تحويل raw لـ tcp
+    if net == "raw": net = "tcp"
+
     stream_settings = {"network": net, "security": security}
     
-    # إعدادات TLS
     if security == "tls":
         stream_settings["tlsSettings"] = {
             "serverName": config.get("sni") or config.get("server"), 
-            "allowInsecure": True, # ضروري حيت الـ IP تبدل لكلاودفلير
+            "allowInsecure": True,
             "fingerprint": config.get("fp") or "chrome"
         }
         if config.get("alpn"): 
-            stream_settings["tlsSettings"]["alpn"] = config["alpn"].split(",")
+            alpn_list = [a.strip() for a in config["alpn"].split(",") if a.strip()]
+            if alpn_list:
+                stream_settings["tlsSettings"]["alpn"] = alpn_list
             
     elif security == "reality":
         stream_settings["realitySettings"] = {
@@ -123,20 +126,20 @@ def make_xray_config(config, local_port):
             "publicKey": config.get("pbk"), "shortId": config.get("sid"), "spiderX": config.get("spx"),
         }
 
-    # دعم بروتوكولات النقل (Transport)
     if net == "ws":
         stream_settings["wsSettings"] = {"path": config.get("path", "/"), "host": config.get("host") or config.get("sni")}
     elif net == "grpc":
-        stream_settings["grpcSettings"] = {"serviceName": config.get("serviceName") or config.get("path")}
+        stream_settings["grpcSettings"] = {"serviceName": config.get("serviceName") or config.get("path") or ""}
     elif net == "xhttp":
         stream_settings["xhttpSettings"] = {"path": config.get("path", "/"), "host": config.get("host") or config.get("sni")}
-    elif net in ["tcp", "raw"]:
-        stream_settings["network"] = "tcp"
+    elif net == "tcp":
         stream_settings["tcpSettings"] = {"header": {"type": "none"}}
 
     if config["protocol"] == "vless":
         user = {"id": config["uuid"], "encryption": "none"}
-        if config.get("flow"): user["flow"] = config["flow"]
+        # إصلاح: الـ flow كيخدم غير مع tcp
+        if config.get("flow") and net == "tcp": 
+            user["flow"] = config["flow"]
         outbound = {"protocol": "vless", "settings": {"vnext": [{"address": config["server"], "port": config["port"], "users": [user]}]}, "streamSettings": stream_settings}
     elif config["protocol"] == "trojan":
         outbound = {"protocol": "trojan", "settings": {"servers": [{"address": config["server"], "port": config["port"], "password": config["password"]}]}, "streamSettings": stream_settings}
@@ -152,7 +155,7 @@ def test_config(index, config):
     
     try:
         xray_config = make_xray_config(config, local_port)
-        if not xray_config: return {"ok": False, "reason": "make_failed"}
+        if not xray_config: return {"ok": False, "reason": "make_failed", "server": config.get("server", "Unknown")}
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(xray_config, f)
@@ -172,17 +175,26 @@ def test_config(index, config):
             except OSError: time.sleep(0.2)
 
         if not started: 
-            return {"ok": False, "reason": "xray_died"}
+            # إصلاح: قراءة سبب الطيحة من اللوغ
+            error_log = ""
+            try:
+                with open(log_file, "r", errors="ignore") as f:
+                    error_log = f.read().strip().replace("\n", " | ")
+            except Exception:
+                pass
+            return {"ok": False, "reason": f"xray_died: {error_log[-150:]}", "server": config.get("server", "Unknown")}
 
         proxies = {"http": f"http://127.0.0.1:{local_port}", "https": f"http://127.0.0.1:{local_port}"}
         latency, err = test_once(proxies)
         
         if latency is not None and latency <= MAX_LATENCY_MS:
-            return {"ok": True, "latency": latency, "line": config["original"], "server": config["server"]}
-        return {"ok": False, "reason": err, "server": config["server"]}
+            return {"ok": True, "latency": latency, "line": config["original"], "server": config.get("server", "Unknown")}
+        return {"ok": False, "reason": err, "server": config.get("server", "Unknown")}
 
+    except FileNotFoundError:
+        return {"ok": False, "reason": "xray_binary_missing", "server": config.get("server", "Unknown")}
     except Exception as e:
-        return {"ok": False, "reason": str(type(e).__name__), "server": config["server"]}
+        return {"ok": False, "reason": str(type(e).__name__), "server": config.get("server", "Unknown")}
     finally:
         if process:
             try: process.terminate(); process.wait(timeout=0.5)
