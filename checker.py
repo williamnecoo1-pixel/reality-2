@@ -7,6 +7,7 @@ import tempfile
 import time
 import base64
 import threading
+import re
 from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
@@ -26,6 +27,12 @@ TIMEOUT = 15
 MAX_WORKERS = 15 
 BASE_PORT = 10808
 MAX_LATENCY_MS = 5000
+
+# دالة للتأكد من أن الـ UUID صحيح (8-4-4-4-12)
+def is_valid_uuid(uuid_string):
+    if not uuid_string: return False
+    pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+    return bool(pattern.match(uuid_string))
 
 _tls = threading.local()
 def get_session():
@@ -75,6 +82,9 @@ def parse_config(line):
             b64_str = line[8:].split("#")[0].strip()
             b64_str += "=" * ((4 - len(b64_str) % 4) % 4)
             config = json.loads(base64.b64decode(b64_str).decode('utf-8'))
+            
+            if not is_valid_uuid(config.get("id", "")): return None
+            
             return {
                 "protocol": "vmess", "server": config.get("add"), "port": int(config.get("port", 443)),
                 "id": config.get("id"), "aid": int(config.get("aid", 0)), "scy": config.get("scy", "auto"),
@@ -87,14 +97,20 @@ def parse_config(line):
             params = parse_qs(parsed.query, keep_blank_values=True)
             get = lambda name: params.get(name, [""])[0]
             net_type = (get("type") or get("net") or "tcp").lower()
+            
+            uuid = parsed.username
+            if not is_valid_uuid(uuid): return None
+            
             return {
                 "protocol": parsed.scheme.lower(), "server": parsed.hostname or get("host"), "port": parsed.port or 443,
-                "uuid": parsed.username, "password": parsed.username, "net": net_type,
+                "uuid": uuid, "password": uuid, "net": net_type,
                 "security": get("security") or "none", "sni": get("sni") or parsed.hostname,
                 "host": get("host") or "", "path": unquote(get("path")) or "/", "alpn": get("alpn") or "",
                 "fp": get("fp") or "", "pbk": get("pbk") or "", "sid": get("sid") or "",
                 "spx": get("spx") or "/", "flow": get("flow") or "", "original": line,
-                "serviceName": get("serviceName") 
+                "serviceName": get("serviceName"),
+                "pcs": get("pcs") or "", # Pinned Certificate SHA256
+                "vcn": get("vcn") or ""  # Verify Cert By Name
             }
     except Exception:
         return None
@@ -109,15 +125,27 @@ def make_xray_config(config, local_port):
     stream_settings = {"network": net, "security": security}
     
     if security == "tls":
-        stream_settings["tlsSettings"] = {
+        tls_settings = {
             "serverName": config.get("sni") or config.get("server"), 
-            "allowInsecure": True, # إجباري هنا حيت كنستعملو كلاودفلير
             "fingerprint": config.get("fp") or "chrome"
         }
+        
+        # التعامل مع allowInsecure الجديد
+        if config.get("pcs"):
+            tls_settings["pinnedPeerCertSha256"] = config["pcs"]
+        elif config.get("vcn"):
+            tls_settings["verifyPeerCertByName"] = config["vcn"]
+        else:
+            # إذا لم يوجد أي منهما، نستخدم verifyPeerCertByName كحل احتياطي
+            # ملاحظة: هذا سيتحقق من الشهادة، وقد يفشل إذا كانت الشهادة غير صالحة
+            tls_settings["verifyPeerCertByName"] = config.get("sni") or config.get("server")
+        
         if config.get("alpn"): 
             alpn_list = [a.strip() for a in config["alpn"].split(",") if a.strip()]
             if alpn_list:
-                stream_settings["tlsSettings"]["alpn"] = alpn_list
+                tls_settings["alpn"] = alpn_list
+                
+        stream_settings["tlsSettings"] = tls_settings
             
     elif security == "reality":
         stream_settings["realitySettings"] = {
@@ -151,7 +179,6 @@ def test_config(index, config):
     local_port = BASE_PORT + (index % 40000)
     config_file, log_file, process = None, None, None
     
-    # معرفة نوع الكونفيغ للطباعة
     net_type = config.get("net", "unknown").upper()
     server_ip = config.get("server", "Unknown")
     
@@ -164,7 +191,6 @@ def test_config(index, config):
             config_file = f.name
 
         log_file = tempfile.NamedTemporaryFile(suffix=".log", delete=False).name
-        # توجيه stdout و stderr للوغ معاً باش نمسكو أي غلط
         with open(log_file, "w") as log_handle:
             process = subprocess.Popen([XRAY, "run", "-c", config_file], stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -193,8 +219,6 @@ def test_config(index, config):
             return {"ok": True, "latency": latency, "line": config["original"], "server": f"[{net_type}] {server_ip}"}
         return {"ok": False, "reason": err, "server": f"[{net_type}] {server_ip}"}
 
-    except FileNotFoundError:
-        return {"ok": False, "reason": "xray_binary_missing", "server": f"[{net_type}] {server_ip}"}
     except Exception as e:
         return {"ok": False, "reason": str(type(e).__name__), "server": f"[{net_type}] {server_ip}"}
     finally:
@@ -211,9 +235,15 @@ def test_config(index, config):
 def main():
     print("Downloading configs...", flush=True)
     lines = download_configs()
-    configs = [c for c in (parse_config(l) for l in lines) if c]
+    
+    parsed_configs = []
+    for l in lines:
+        c = parse_config(l)
+        if c: parsed_configs.append(c)
+        
+    configs = parsed_configs
     total = len(configs)
-    print(f"\n✅ Total configs to test: {total}\n", flush=True)
+    print(f"\n✅ Total VALID configs to test: {total}\n", flush=True)
 
     if not configs: return
 
