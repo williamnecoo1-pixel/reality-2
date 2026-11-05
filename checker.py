@@ -19,8 +19,9 @@ SOURCE_URLS = [
 XRAY = "./xray/xray"
 
 TEST_URLS = [
+    "https://www.youtube.com/generate_204",
     "http://www.gstatic.com/generate_204",
-    "http://www.apple.com/generate_204",
+    
 ]
 
 TIMEOUT = 15
